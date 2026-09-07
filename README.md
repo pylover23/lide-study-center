@@ -8,7 +8,37 @@
 
 ---
 
-## 一、原理详解
+## 一、文件结构
+
+```text
+lide_study_center/
+├── main.py                      # 入口：run/test/login/status/records 子命令 + --at 调度
+├── gui_app.py                   # Tkinter GUI 入口
+├── gui_workers.py               # Tkinter 后台任务执行器
+├── config.example.json          # 可提交的配置模板
+├── config.json                  # 本地真实账号/房间配置（.gitignore）
+├── state.json                   # 运行时：token、签发时间、幂等标记（.gitignore）
+├── requirements.txt
+├── lide_study_center_gui.spec   # PyInstaller GUI 打包配置
+├── lib/
+│   ├── httpclient.py            # Session 封装：400ms 全局节流、退避重试、手动 302 跟跳
+│   ├── encrypt.py               # AES-128-CTR + RSA-1024 信封加密
+│   ├── slider.py                # numpy 缺口定位 + 拟人轨迹 + gen/check 全链
+│   ├── login.py                 # CAS + ddddocr + OAuth + appletBind + token 缓存
+│   ├── book.py                  # 查座、预约提交、预约历史查询
+│   ├── gui_service.py           # GUI 服务层：登录、记录、房间、座位、预约
+│   ├── runtime_paths.py         # GUI 运行时目录
+│   └── scheduler.py             # --at 日循环调度（补跑/顺延/每日至多一次）
+├── tests/                       # 单元测试
+├── logs/                        # 按日 JSONL 运行摘要（.gitignore）
+├── artifacts/                   # 失败诊断产物（.gitignore）
+├── build/                       # 本地打包中间产物（.gitignore）
+└── dist/                        # 本地 exe 产物（.gitignore）
+```
+
+---
+
+## 二、原理详解
 
 ### 1. 总体架构
 
@@ -140,7 +170,7 @@ key|iv   ──RSA-1024-PKCS1v1.5(站点公钥)──▶ base64 ──▶ ki 字
 
 ---
 
-## 二、使用方法
+## 三、使用方法
 
 ### 1. 环境要求
 
@@ -294,57 +324,3 @@ python -m unittest discover -s tests -v
 覆盖：AES-CTR/RSA 信封对拍、滑块缺口定位回归（真实抓包样本）、轨迹格式、
 调度器不变量（每日至多一次、异常不退出、启动过点顺延）、GUI 服务与 GitHub 打包卫生。
 
----
-
-## 三、GitHub 上传建议
-
-- 仓库提交源码、测试、README、`requirements.txt`、`config.example.json` 和 `lide_study_center_gui.spec`。
-- 不提交 `config.json`、`state.json`、`logs/`、`artifacts/`、`build/`、`dist/`、`*.exe`。
-- 如果要公开仓库，上传前再次确认没有真实学号、密码、token、日志或验证码样本。
-- exe 建议走 GitHub Releases；源码仓库保持轻量、可审计。
-
-初始化并提交：
-
-```powershell
-git init
-git add .
-git commit -m "chore: prepare project for GitHub"
-```
-
-关联远程仓库后推送：
-
-```powershell
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git branch -M main
-git push -u origin main
-```
-
----
-
-## 四、文件结构
-
-```text
-lide_study_center/
-├── main.py                      # 入口：run/test/login/status/records 子命令 + --at 调度
-├── gui_app.py                   # Tkinter GUI 入口
-├── gui_workers.py               # Tkinter 后台任务执行器
-├── config.example.json          # 可提交的配置模板
-├── config.json                  # 本地真实账号/房间配置（.gitignore）
-├── state.json                   # 运行时：token、签发时间、幂等标记（.gitignore）
-├── requirements.txt
-├── lide_study_center_gui.spec   # PyInstaller GUI 打包配置
-├── lib/
-│   ├── httpclient.py            # Session 封装：400ms 全局节流、退避重试、手动 302 跟跳
-│   ├── encrypt.py               # AES-128-CTR + RSA-1024 信封加密
-│   ├── slider.py                # numpy 缺口定位 + 拟人轨迹 + gen/check 全链
-│   ├── login.py                 # CAS + ddddocr + OAuth + appletBind + token 缓存
-│   ├── book.py                  # 查座、预约提交、预约历史查询
-│   ├── gui_service.py           # GUI 服务层：登录、记录、房间、座位、预约
-│   ├── runtime_paths.py         # GUI 运行时目录
-│   └── scheduler.py             # --at 日循环调度（补跑/顺延/每日至多一次）
-├── tests/                       # 单元测试
-├── logs/                        # 按日 JSONL 运行摘要（.gitignore）
-├── artifacts/                   # 失败诊断产物（.gitignore）
-├── build/                       # 本地打包中间产物（.gitignore）
-└── dist/                        # 本地 exe 产物（.gitignore）
-```
