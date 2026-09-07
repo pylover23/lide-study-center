@@ -1,0 +1,25 @@
+{
+  "username": "your_student_id",
+  "password": "your_password",
+  "rooms": [
+    {
+      "roomId": "1661583581389099008",
+      "name": "研学自习位(15层)"
+    },
+    {
+      "roomId": "1666357033522270208",
+      "name": "研学自习位(14层)"
+    }
+  ],
+  "seatPreferLow": 1,
+  "seatPreferHigh": 0,
+  "seatExclude": [],
+  "maxSeatsTry": 8,
+  "sliderRetries": 3,
+  "sliderAttempts": 5,
+  "pollIntervalSec": 45,
+  "pollMaxMin": 20,
+  "maxRequests": 120,
+  "watchdogSec": 720,
+  "preWarmSec": 60
+}

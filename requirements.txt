@@ -1,0 +1,6 @@
+requests>=2.31
+cryptography>=42.0
+Pillow>=10.0
+numpy>=1.26
+ddddocr>=1.4
+pyinstaller>=6.10

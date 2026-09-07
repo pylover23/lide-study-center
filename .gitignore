@@ -1,0 +1,27 @@
+# Local credentials and runtime state
+config.json
+state.json
+.env
+
+# Runtime diagnostics
+logs/
+artifacts/
+*.log
+captcha_*.png
+_probe_*.py
+
+# Python cache and virtual environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller build outputs
+build/
+dist/
+*.exe
+
+# Miscellaneous temporary files
+*.tmp
+node_modules/
