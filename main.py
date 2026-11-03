@@ -17,12 +17,13 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
+from enum import Enum
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib.httpclient import HttpClient
+from lib.httpclient import HttpClient, RequestLimitError
 from lib import login, book
-from lib.slider import solve_slider
+from lib.slider import SliderServiceUnavailable, solve_slider
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
@@ -94,7 +95,7 @@ def resolve_day(day: str) -> str:
         raise SystemExit("--day 取值无效: %r（支持 tomorrow/today/YYYY-MM-DD）" % day)
 
 
-# ---------------- 响应判定（宽松匹配，实测后收敛） ----------------
+# ---------------- 响应判定 ----------------
 def is_success(j: dict) -> bool:
     return j.get("status") is True and j.get("code") == 200
 
@@ -104,150 +105,282 @@ def _msg(j: dict) -> str:
 
 
 def is_seat_taken(j: dict) -> bool:
-    m = _msg(j)
-    return any(k in m for k in ("已被", "已约", "占用", "被抢", "不可预约"))
+    return any(k in _msg(j) for k in ("已被", "已约", "占用", "被抢", "不可预约"))
 
 
 def is_window_closed(j: dict) -> bool:
-    # 实测样本："房间在1788267600000未开放，请重新选择日期"——预约窗口未到/已过。
     return "未开放" in _msg(j) or "重新选择日期" in _msg(j)
 
 
 def is_captcha_err(j: dict) -> bool:
-    m = _msg(j)
-    return any(k in m for k in ("验证", "captcha", "滑块", "过期"))
+    message = _msg(j).lower()
+    return any(k in message for k in ("验证", "captcha", "滑块"))
 
 
 def is_rate_limited(j: dict) -> bool:
-    # 实测样本（短时连续提交）："请勿频繁操作 请稍后再试"——退避后重试。
     return "频繁" in _msg(j)
 
 
-# ---------------- 抢座编排 ----------------
-def try_book_room(client, token, room, seats, target_date, cfg) -> str:
-    """对单房间按候选座位逐个尝试。返回 'ok' | 'taken_all' | 'error:<msg>'。
+class BookingResult(Enum):
+    OK = "ok"
+    EXHAUSTED = "exhausted"
+    AUTH_EXPIRED = "auth_expired"
+    WINDOW_CLOSED = "window_closed"
+    CAPTCHA_UNAVAILABLE = "captcha_unavailable"
+    TRANSIENT_ERROR = "transient_error"
 
-    实测约束：滑块 code 一次性（提交即消费，无论成败），故每座必新解；
-    连续提交会触发"请勿频繁操作"限流，退避 3-5s 后原 code 已废须重解。
-    """
+
+def _inc_stat(client, key: str) -> None:
+    client.stats[key] = client.stats.get(key, 0) + 1
+
+
+# ---------------- 抢座编排 ----------------
+def try_book_room(client, token, room, seats, target_date, cfg,
+                  attempted_seats: set[int]) -> BookingResult:
+    """Submit fresh slider codes until a typed terminal outcome is known."""
     slider_retries = cfg.get("sliderRetries", 3)
     for seat in seats:
-        cap_fails = 0
-        while cap_fails <= slider_retries:
+        captcha_rejections = 0
+        unknown_failures = 0
+        while True:
             try:
-                code = solve_slider(client, cfg["username"],
-                                    max_attempts=cfg.get("sliderAttempts", 5),
-                                    log=lambda s: log.info(s))
-            except Exception as e:
-                cap_fails += 1
-                client.stats["slider_fail"] += 1
-                log.warning("房间[%s] 座位%d 滑块破解失败(%d): %s",
-                            room["name"], seat, cap_fails, e)
-                if cap_fails > slider_retries:
-                    return "error:滑块破解超限"
-                continue
-            j = book.submit_reservation(client, token, room["roomId"], seat,
-                                        target_date, code)
-            save_artifact("save_%s_seat%d.json" % (target_date, seat),
-                          json.dumps(j, ensure_ascii=False, indent=1))
-            if is_success(j):
+                code = solve_slider(
+                    client,
+                    cfg["username"],
+                    max_attempts=cfg.get("sliderAttempts", 5),
+                    log=lambda message: log.info(message),
+                )
+            except RequestLimitError:
+                raise
+            except SliderServiceUnavailable as exc:
+                _inc_stat(client, "slider_fail")
+                log.warning("captcha_unavailable 房间[%s] 座位%d: %s",
+                            room["name"], seat, exc)
+                return BookingResult.CAPTCHA_UNAVAILABLE
+            except Exception as exc:
+                _inc_stat(client, "slider_fail")
+                log.warning("captcha_unavailable 房间[%s] 座位%d: %s",
+                            room["name"], seat, exc)
+                return BookingResult.CAPTCHA_UNAVAILABLE
+
+            try:
+                response = book.submit_reservation(
+                    client, token, room["roomId"], seat, target_date, code,
+                )
+            except RequestLimitError:
+                raise
+            except Exception as exc:
+                _inc_stat(client, "submit_fail")
+                log.error("submit_transport_unknown 房间[%s] 座位%d: %s",
+                          room["name"], seat, exc)
+                return BookingResult.TRANSIENT_ERROR
+
+            artifact = "save_%s_%s_seat%d_%d.json" % (
+                target_date, room["roomId"], seat, time.time_ns(),
+            )
+            save_artifact(artifact, json.dumps(response, ensure_ascii=False, indent=1))
+            if is_success(response):
                 log.info("预约成功: %s %d号位 (%s)", room["name"], seat, target_date)
-                return "ok"
-            client.stats["submit_fail"] += 1
-            if is_window_closed(j):
-                log.info("预约窗口未开放: %s", _msg(j))
-                return "error:window_closed"
-            if is_rate_limited(j):
+                return BookingResult.OK
+
+            _inc_stat(client, "submit_fail")
+            if login.is_token_expired(response):
+                log.warning("auth_expired 房间[%s] 座位%d: %s",
+                            room["name"], seat, _msg(response))
+                return BookingResult.AUTH_EXPIRED
+            if is_window_closed(response):
+                log.info("预约窗口未开放: %s", _msg(response))
+                return BookingResult.WINDOW_CLOSED
+            if is_rate_limited(response):
+                _inc_stat(client, "rate_limit")
                 wait_s = random.uniform(3, 5)
-                log.warning("触发限流，退避 %.1f 秒后重解再试: %s", wait_s, _msg(j))
+                log.warning("rate_limited 退避 %.1f 秒后为原座重解: %s",
+                            wait_s, _msg(response))
                 time.sleep(wait_s)
-                cap_fails += 1
                 continue
-            if is_captcha_err(j):
-                cap_fails += 1
-                log.warning("验证码被拒(%d): %s", cap_fails, _msg(j))
+            if is_captcha_err(response):
+                captcha_rejections += 1
+                _inc_stat(client, "captcha_reject")
+                log.warning("captcha_reject 座位%d (%d/%d): %s",
+                            seat, captcha_rejections, slider_retries, _msg(response))
+                if captcha_rejections > slider_retries:
+                    return BookingResult.CAPTCHA_UNAVAILABLE
+                time.sleep(random.uniform(1, 2))
                 continue
-            if is_seat_taken(j):
-                log.info("座位 %d 已被抢: %s", seat, _msg(j))
+            if is_seat_taken(response):
+                attempted_seats.add(seat)
+                log.info("seat_taken 座位%d: %s", seat, _msg(response))
                 break
-            log.warning("预约失败(未知响应，换下一座): %s", _msg(j))
-            break
-    return "taken_all"
+
+            unknown_failures += 1
+            log.warning("unknown 座位%d (%d/3): %s",
+                        seat, unknown_failures, _msg(response))
+            if unknown_failures >= 3:
+                return BookingResult.TRANSIENT_ERROR
+            time.sleep(random.uniform(3, 5))
+    return BookingResult.EXHAUSTED
 
 
 def do_grab(cfg, target: str) -> int:
-    """一次完整抢座流程（target: YYYY-MM-DD）。返回退出码。"""
+    """Run one bounded booking state machine for ``target``."""
     t0 = time.time()
     state = login.load_state(STATE_FILE)
     if state.get("lastSuccessDate") == target:
         log.info("幂等检查：%s 已成功预约，跳过", target)
         return EXIT_OK
 
-    client = HttpClient()
-    start_watchdog(cfg.get("watchdogSec", 720))
-
+    client = HttpClient(max_requests=cfg.get("maxRequests", 120))
+    watchdog = start_watchdog(cfg.get("watchdogSec", 720))
     try:
-        token = login.get_token(client, cfg["username"], cfg["password"], STATE_FILE)
-    except login.AuthError as e:
-        log.error("认证失败: %s", e)
-        _summary(cfg, target, "auth_fail", EXIT_AUTH, t0, client)
-        return EXIT_AUTH
+        try:
+            token = login.get_token(client, cfg["username"], cfg["password"], STATE_FILE)
+        except login.AuthError as exc:
+            log.error("认证失败: %s", exc)
+            _summary(cfg, target, "auth_fail", EXIT_AUTH, t0, client)
+            return EXIT_AUTH
 
-    rooms = cfg.get("rooms", [])
-    poll_until = time.time() + cfg.get("pollMaxMin", 20) * 60
-    tried_rooms = 0
-    while True:
-        if client.request_count >= cfg.get("maxRequests", 120):
-            log.error("请求硬上限 %d 已用尽，中止本轮", client.request_count)
-            _summary(cfg, target, "req_limit", EXIT_FULL, t0, client)
-            return EXIT_FULL
+        rooms = cfg.get("rooms", [])
+        attempted_by_room = {str(room["roomId"]): set() for room in rooms}
+        poll_until = time.time() + cfg.get("pollMaxMin", 20) * 60
+        auth_refreshed = False
+        query_failure_rounds = 0
 
-        any_seat = False
-        for room in rooms:
-            try:
-                seats = book.available_seats(client, token, room["roomId"], target)
-            except Exception as e:
-                msg = str(e)
-                log.warning("查座失败 [%s]: %s", room["name"], msg)
-                if "401" in msg:  # token 失效，重登一次
-                    try:
-                        token = login.get_token(client, cfg["username"], cfg["password"],
-                                                STATE_FILE, force_refresh=True)
-                    except login.AuthError as ae:
-                        log.error("重登失败: %s", ae)
+        while True:
+            successful_queries = 0
+            failed_queries = 0
+            any_seat = False
+            restart_scan = False
+
+            for room in rooms:
+                room_id = str(room["roomId"])
+                try:
+                    seats = book.available_seats(client, token, room_id, target)
+                except RequestLimitError:
+                    raise
+                except Exception as exc:
+                    if login.is_token_expired(exc):
+                        if auth_refreshed:
+                            log.error("auth_fail 第二次认证失效: %s", exc)
+                            _summary(cfg, target, "auth_fail", EXIT_AUTH, t0, client)
+                            return EXIT_AUTH
+                        try:
+                            token = login.get_token(
+                                client,
+                                cfg["username"],
+                                cfg["password"],
+                                STATE_FILE,
+                                force_refresh=True,
+                            )
+                        except login.AuthError as auth_exc:
+                            log.error("auth_fail 重登失败: %s", auth_exc)
+                            _summary(cfg, target, "auth_fail", EXIT_AUTH, t0, client)
+                            return EXIT_AUTH
+                        auth_refreshed = True
+                        _inc_stat(client, "token_refresh")
+                        restart_scan = True
+                        break
+                    failed_queries += 1
+                    _inc_stat(client, "query_fail")
+                    log.warning("query_fail [%s]: %s", room["name"], exc)
+                    continue
+
+                successful_queries += 1
+                log.info("[%s] 可约 %d 个: %s", room["name"], len(seats),
+                         seats[:20] if len(seats) > 20 else seats)
+                if not seats:
+                    continue
+                any_seat = True
+                attempted = attempted_by_room[room_id]
+                remaining = [seat for seat in book.order_candidates(seats, cfg)
+                             if seat not in attempted]
+                if not remaining:
+                    wait_s = random.uniform(3, 5)
+                    log.info("[%s] 当前可用座均已确认被占，%.1f 秒后开启新轮次",
+                             room["name"], wait_s)
+                    time.sleep(wait_s)
+                    attempted.clear()
+                    restart_scan = True
+                    break
+
+                candidates = remaining[:cfg.get("maxSeatsTry", 8)]
+                result = try_book_room(
+                    client, token, room, candidates, target, cfg, attempted,
+                )
+                if result is BookingResult.OK:
+                    latest_state = login.load_state(STATE_FILE)
+                    latest_state["lastSuccessDate"] = target
+                    latest_state["lastSeat"] = {
+                        "room": room["name"],
+                        "date": target,
+                    }
+                    login.save_state(latest_state, STATE_FILE)
+                    _summary(cfg, target, "success", EXIT_OK, t0, client)
+                    return EXIT_OK
+                if result is BookingResult.AUTH_EXPIRED:
+                    if auth_refreshed:
+                        log.error("auth_fail 第二次认证失效")
                         _summary(cfg, target, "auth_fail", EXIT_AUTH, t0, client)
                         return EXIT_AUTH
-                continue
-            log.info("[%s] 可约 %d 个: %s", room["name"], len(seats),
-                     seats[:20] if len(seats) > 20 else seats)
-            if not seats:
-                continue
-            any_seat = True
-            tried_rooms += 1
-            order = book.order_candidates(seats, cfg)[:cfg.get("maxSeatsTry", 8)]
-            res = try_book_room(client, token, room, order, target, cfg)
-            if res == "ok":
-                state["lastSuccessDate"] = target
-                state["lastSeat"] = {"room": room["name"], "date": target}
-                login.save_state(state, STATE_FILE)
-                _summary(cfg, target, "success", EXIT_OK, t0, client)
-                return EXIT_OK
-            if res == "error:window_closed":
-                log.error("预约窗口尚未开放(%s)，本轮中止（请确认 --at 时刻在开放窗口内）", target)
-                _summary(cfg, target, "window_closed", EXIT_FULL, t0, client)
-                return EXIT_FULL
-            log.info("[%s] 本轮未成功(%s)，继续下一房间", room["name"], res)
+                    try:
+                        token = login.get_token(
+                            client,
+                            cfg["username"],
+                            cfg["password"],
+                            STATE_FILE,
+                            force_refresh=True,
+                        )
+                    except login.AuthError as exc:
+                        log.error("auth_fail 重登失败: %s", exc)
+                        _summary(cfg, target, "auth_fail", EXIT_AUTH, t0, client)
+                        return EXIT_AUTH
+                    auth_refreshed = True
+                    _inc_stat(client, "token_refresh")
+                    restart_scan = True
+                    break
+                if result is BookingResult.WINDOW_CLOSED:
+                    log.error("预约窗口尚未开放(%s)，本轮中止", target)
+                    _summary(cfg, target, "window_closed", EXIT_FULL, t0, client)
+                    return EXIT_FULL
+                if result is BookingResult.CAPTCHA_UNAVAILABLE:
+                    log.warning("captcha_unavailable 全局冷却 5 秒后重查原座")
+                    time.sleep(5)
+                    restart_scan = True
+                    break
+                if result is BookingResult.TRANSIENT_ERROR:
+                    _summary(cfg, target, "submit_unknown", EXIT_UNKNOWN, t0, client)
+                    return EXIT_UNKNOWN
 
-        if any_seat or tried_rooms > 0:
-            # 有空位但没抢到：立即再扫一轮（不等待）
-            continue
-        # 全满：轮询蹲守首选房间
-        if time.time() > poll_until:
-            log.info("蹲守超时（%d 分钟），判定满座退出", cfg.get("pollMaxMin", 20))
-            _summary(cfg, target, "full", EXIT_FULL, t0, client)
-            return EXIT_FULL
-        log.info("全满，%d 秒后轮询...", cfg.get("pollIntervalSec", 45))
-        time.sleep(cfg.get("pollIntervalSec", 45))
+            if restart_scan:
+                continue
+            if failed_queries:
+                query_failure_rounds += 1
+                delay = (1, 2, 4)[min(query_failure_rounds - 1, 2)]
+                log.warning("查询结果不完整，第%d轮；%d 秒后重查",
+                            query_failure_rounds, delay)
+                time.sleep(delay)
+                if query_failure_rounds >= 3:
+                    _summary(cfg, target, "query_fail", EXIT_UNKNOWN, t0, client)
+                    return EXIT_UNKNOWN
+                continue
+
+            query_failure_rounds = 0
+            if any_seat:
+                continue
+            if successful_queries != len(rooms):
+                _summary(cfg, target, "query_fail", EXIT_UNKNOWN, t0, client)
+                return EXIT_UNKNOWN
+            if time.time() > poll_until:
+                log.info("蹲守超时（%d 分钟），判定满座退出", cfg.get("pollMaxMin", 20))
+                _summary(cfg, target, "full", EXIT_FULL, t0, client)
+                return EXIT_FULL
+            log.info("全满，%d 秒后轮询...", cfg.get("pollIntervalSec", 45))
+            time.sleep(cfg.get("pollIntervalSec", 45))
+    except RequestLimitError as exc:
+        log.error("req_limit: %s", exc)
+        _summary(cfg, target, "req_limit", EXIT_FULL, t0, client)
+        return EXIT_FULL
+    finally:
+        watchdog.cancel()
 
 
 def _summary(cfg, target, result, exit_code, t0, client):
@@ -283,7 +416,12 @@ def cmd_run(args) -> int:
 
         log.info("进入每日调度模式，触发时刻 %s（Ctrl+C 退出）", args.at)
         try:
-            run_daily_at(args.at, job, on_tick=preheat)
+            run_daily_at(
+                args.at,
+                job,
+                on_tick=preheat,
+                pre_warm_sec=cfg.get("preWarmSec", 60),
+            )
         except KeyboardInterrupt:
             log.info("手动停止调度")
         return 0
@@ -298,7 +436,7 @@ def cmd_test(args) -> int:
     except login.AuthError as e:
         log.error("认证失败: %s", e)
         return EXIT_AUTH
-    log.info("token 有效: %s...", token[:12])
+    log.info("token 有效")
     target = resolve_day(getattr(args, "day", None))
     for room in cfg["rooms"]:
         seats = book.query_seats(client, token, room["roomId"], target)
@@ -306,10 +444,10 @@ def cmd_test(args) -> int:
         log.info("[%s] %s: 总 %d 座，可约 %d 个 %s", room["name"], target,
                  len(seats), len(free), free[:20])
     if args.slider:
-        code = solve_slider(client, cfg["username"],
-                            max_attempts=cfg.get("sliderAttempts", 5),
-                            log=lambda s: log.info(s))
-        log.info("滑块链路验证通过: %s（未提交预约）", code)
+        solve_slider(client, cfg["username"],
+                     max_attempts=cfg.get("sliderAttempts", 5),
+                     log=lambda s: log.info(s))
+        log.info("滑块链路验证通过（未提交预约）")
     if args.save_probe:
         # 安全采集错误码样本：故意用无效滑块 token 提交，不产生真实预约。
         # 样本用于收敛 is_seat_taken / is_captcha_err 判定。

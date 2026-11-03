@@ -16,11 +16,9 @@ from datetime import datetime, timedelta
 
 log = logging.getLogger("scheduler")
 
-PRE_WARM_SEC = 60  # 触发前 60 秒调用 on_tick 预热（对应 config.preWarmSec 开关）
 
-
-def run_daily_at(hhmm: str, job, on_tick=None) -> None:
-    """hhmm: 'HH:MM'；job: 无参可调用对象（一次完整抢座流程）。"""
+def run_daily_at(hhmm: str, job, on_tick=None, pre_warm_sec: int = 60) -> None:
+    """Run ``job`` daily, optionally warming authentication before the target."""
     h, m = (int(x) for x in hhmm.split(":"))
     last_run_date = None  # 已执行过的目标日期，保证每日至多一次
 
@@ -38,19 +36,23 @@ def run_daily_at(hhmm: str, job, on_tick=None) -> None:
 
         slept = False
         warmed = False
-        while datetime.now() < target:
-            wait = (target - datetime.now()).total_seconds()
+        while True:
+            now = datetime.now()
+            if now >= target:
+                break
+            wait = (target - now).total_seconds()
             if not slept:
                 log.info("下次执行: %s（等待 %.0f 秒）", target, wait)
                 slept = True
-            if not warmed and wait <= PRE_WARM_SEC:
+            if pre_warm_sec > 0 and not warmed and wait <= pre_warm_sec:
                 warmed = True
                 if on_tick:
-                    on_tick()  # 触发前 60 秒预热钩子（如 token 探活）
-            time.sleep(min(max(wait, 0), 3600))  # 分段睡，休眠唤醒后可校准
+                    on_tick()
+                continue
+            time.sleep(min(wait, 3600))  # 分段睡，休眠唤醒后可校准
 
-        if on_tick and not warmed:
-            on_tick()  # 兜底：休眠唤醒错过 60 秒预热点时，执行前仍预热一次
+        if pre_warm_sec > 0 and on_tick and not warmed:
+            on_tick()  # 休眠唤醒错过预热点时，执行前兜底预热
         started = time.time()
         try:
             job()

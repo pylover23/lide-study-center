@@ -13,11 +13,16 @@ THROTTLE_MS = 400
 RETRY_DELAYS = (1, 3, 6)
 
 
+class RequestLimitError(RuntimeError):
+    """Raised before a request would exceed the configured physical limit."""
+
 class HttpClient:
     """跨域共享 cookie 的 HTTP 客户端（CAS -> 广场 -> yxkj 一条链）。"""
 
-    def __init__(self, base: str = "https://yxkj.ruc.edu.cn", headers: dict | None = None):
+    def __init__(self, base: str = "https://yxkj.ruc.edu.cn",
+                 headers: dict | None = None, max_requests: int | None = None):
         self.base = base.rstrip("/")
+        self.max_requests = max_requests
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -30,12 +35,25 @@ class HttpClient:
         self._last_req_time = 0.0
         self.request_count = 0
         # 本轮运行统计（写入日志摘要行）
-        self.stats = {"slider_fail": 0, "submit_fail": 0}
+        self.stats = {
+            "slider_fail": 0,
+            "submit_fail": 0,
+            "captcha_reject": 0,
+            "rate_limit": 0,
+            "token_refresh": 0,
+            "query_fail": 0,
+        }
 
     # ---- 基础请求 ----
-    def raw(self, method: str, url: str, *, allow_redirects=False, **kw) -> requests.Response:
-        """带节流/重试的单次请求（默认不自动跟跳）。"""
-        for attempt, delay in enumerate([0] + list(RETRY_DELAYS)):
+    def raw(self, method: str, url: str, *, allow_redirects=False,
+            retry_transport: bool = True, **kw) -> requests.Response:
+        """Send a request, counting and limiting every physical attempt."""
+        delays = [0] + (list(RETRY_DELAYS) if retry_transport else [])
+        for attempt, delay in enumerate(delays):
+            if self.max_requests is not None and self.request_count >= self.max_requests:
+                raise RequestLimitError(
+                    "请求硬上限 %d 已用尽" % self.max_requests,
+                )
             if delay:
                 time.sleep(delay + random.uniform(0, 0.5))
             # 全局节流
@@ -51,7 +69,7 @@ class HttpClient:
                 return resp
             except requests.RequestException as e:
                 log.warning("请求失败(%s) 第%d次: %s", url, attempt + 1, e)
-                if attempt == len(RETRY_DELAYS):
+                if attempt == len(delays) - 1:
                     raise
         raise RuntimeError("unreachable")
 

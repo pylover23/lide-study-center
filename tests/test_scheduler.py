@@ -105,6 +105,49 @@ class TestScheduler(unittest.TestCase):
                 scheduler.run_daily_at("23:58", job, on_tick=lambda: ticks.append(1))
         self.assertGreaterEqual(len(ticks), 1)
 
+    def test_preheat_duration_does_not_delay_job(self):
+        times = [
+            datetime(2026, 8, 31, 6, 59, 0),
+            datetime(2026, 8, 31, 6, 59, 30),
+            datetime(2026, 8, 31, 7, 0, 1),
+        ]
+        events = []
+
+        def job():
+            events.append("job")
+            raise KeyboardInterrupt
+
+        def preheat():
+            events.append("preheat")
+
+        with mock.patch("time.sleep") as sleep, \
+                mock.patch.object(scheduler, "datetime", make_fake_dt(times)):
+            with self.assertRaises(KeyboardInterrupt):
+                scheduler.run_daily_at("07:00", job, on_tick=preheat, pre_warm_sec=60)
+
+        self.assertEqual(events, ["preheat", "job"])
+        sleep.assert_not_called()
+
+    def test_zero_preheat_disables_callback(self):
+        times = [
+            datetime(2026, 8, 31, 6, 59, 0),
+            datetime(2026, 8, 31, 6, 59, 30),
+            datetime(2026, 8, 31, 7, 0, 0),
+        ]
+        tick = mock.Mock()
+
+        with mock.patch("time.sleep"), \
+                mock.patch.object(scheduler, "datetime", make_fake_dt(times)):
+            with self.assertRaises(KeyboardInterrupt):
+                scheduler.run_daily_at(
+                    "07:00",
+                    mock.Mock(side_effect=KeyboardInterrupt),
+                    on_tick=tick,
+                    pre_warm_sec=0,
+                )
+
+        tick.assert_not_called()
+
     def test_invalid_hhmm_raises(self):
         with self.assertRaises(ValueError):
             scheduler.run_daily_at("abc", lambda: None)

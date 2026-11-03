@@ -15,7 +15,12 @@ import time
 log = logging.getLogger("book")
 
 class ReservationQueryError(RuntimeError):
-    """预约记录接口返回业务错误。"""
+    """查询接口返回的结构化业务错误。"""
+
+    def __init__(self, response: dict, fallback_message: str):
+        self.response = response
+        self.code = response.get("code")
+        super().__init__(response.get("message") or fallback_message)
 
 
 def _reservation_records(client, token: str, record_type: int,
@@ -33,7 +38,7 @@ def _reservation_records(client, token: str, record_type: int,
                 break
             message = j.get("message") or "预约记录查询失败"
             if "频繁" not in message or attempt:
-                raise ReservationQueryError(message)
+                raise ReservationQueryError(j, "预约记录查询失败")
             time.sleep(3)
         data = j.get("data") or {}
         records.extend(data.get("result") or [])
@@ -76,7 +81,7 @@ def query_all_rooms(client, token: str) -> list:
         headers=_auth_headers(client, token),
     )
     if j.get("status") is not True or j.get("code") != 200:
-        raise ReservationQueryError(j.get("message") or "房间列表查询失败")
+        raise ReservationQueryError(j, "房间列表查询失败")
     return j.get("data") or []
 
 
@@ -88,7 +93,7 @@ def query_system_settings(client, token: str) -> dict:
         token=token,
     )
     if j.get("status") is not True or j.get("code") != 200:
-        raise ReservationQueryError(j.get("message") or "系统设置查询失败")
+        raise ReservationQueryError(j, "系统设置查询失败")
     return j.get("data") or {}
 
 
@@ -99,7 +104,7 @@ def query_room_non_appointment_time(client, token: str, room_id: str) -> list:
         headers=_auth_headers(client, token),
     )
     if j.get("status") is not True or j.get("code") != 200:
-        raise ReservationQueryError(j.get("message") or "不可预约日期查询失败")
+        raise ReservationQueryError(j, "不可预约日期查询失败")
     return j.get("data") or []
 
 
@@ -110,7 +115,7 @@ def query_seat_reservation_time(client, token: str, room_id: str, seat_no: int) 
         headers=_auth_headers(client, token),
     )
     if j.get("status") is not True or j.get("code") != 200:
-        raise ReservationQueryError(j.get("message") or "座位可用时间查询失败")
+        raise ReservationQueryError(j, "座位可用时间查询失败")
     return j.get("data") or []
 
 
@@ -137,7 +142,7 @@ def query_seats(client, token: str, room_id: str, date_str: str) -> list:
     j = client.post_json(client.base + "/kyq/static/frontApi/room/getRoomList",
                          body, token=token)
     if j.get("status") is not True or j.get("code") != 200:
-        raise ReservationQueryError(j.get("message") or "座位查询失败")
+        raise ReservationQueryError(j, "座位查询失败")
     return j.get("data") or []
 
 
@@ -151,8 +156,12 @@ def submit_reservation(client, token: str, room_id: str, seat_no: int,
     body = {"code": slider_code, "endDate": date_str,
             "onDate": date_str, "roomId": room_id, "mobilePhone": "",
             "seatNumber": seat_no, "authorization": True}
-    j = client.post_json(client.base + "/kyq/static/frontApi/reservation/saveReservation",
-                         body, token=token)
+    j = client.post_json(
+        client.base + "/kyq/static/frontApi/reservation/saveReservation",
+        body,
+        token=token,
+        retry_transport=False,
+    )
     return j
 
 
@@ -161,7 +170,7 @@ def order_candidates(seats: list, cfg: dict) -> list:
     pref_lo = cfg.get("seatPreferLow", 1)
     pref_hi = cfg.get("seatPreferHigh", 0)
     excluded = set(cfg.get("seatExclude", []))
-    seats = [s for s in seats if s not in excluded]
+    seats = [s for s in dict.fromkeys(seats) if s not in excluded]
 
     def key(no):
         in_pref = pref_hi > 0 and pref_lo <= no <= pref_hi

@@ -15,7 +15,10 @@ import logging
 import os
 import re
 import time
+from enum import Enum
 from urllib.parse import parse_qs, urlparse
+
+from .httpclient import RequestLimitError
 
 log = logging.getLogger("login")
 
@@ -25,6 +28,32 @@ WAP_LOGIN = ("https://m.ruc.edu.cn/uc/wap/login?redirect="
 OAUTH_URL = ("https://m.ruc.edu.cn/uc/api/oauth/index?redirect="
              "https%3A%2F%2Fyxkj.ruc.edu.cn%2Fremote%2Fstatic%2FrdAuth"
              "&appid=200230106162633619&state=STATE")
+
+TOKEN_EXPIRED_CODES = {401, 20003}
+TOKEN_EXPIRED_MARKERS = (
+    "token访问过期",
+    "token过期",
+    "登录已过期",
+    "登录失效",
+    "登录已失效",
+    "未登录",
+    "请先登录",
+    "401",
+    "Unauthorized",
+)
+
+
+def is_token_expired(value) -> bool:
+    """Return whether a response, typed query error, or message proves expiry."""
+    response = getattr(value, "response", value)
+    if isinstance(response, dict):
+        if response.get("code") in TOKEN_EXPIRED_CODES:
+            return True
+        text = str(response.get("message") or "")
+    else:
+        text = str(response or "")
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in TOKEN_EXPIRED_MARKERS)
 
 DEFAULT_STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                   "state.json")
@@ -146,27 +175,41 @@ def _ocr_engine():
     return ddddocr.DdddOcr(show_ad=False)
 
 
-# ---------------- token 探活 ----------------
-def token_alive(client, token: str) -> bool:
-    """queryAllRoomList 探活。实测：短时连续请求会返回限流（200+"请勿频繁操作"），
-    限流不代表 token 失效，退避 3 秒重探一次以免误杀。"""
+class TokenProbeStatus(Enum):
+    ALIVE = "alive"
+    EXPIRED = "expired"
+    INDETERMINATE = "indeterminate"
+
+
+def probe_token(client, token: str) -> TokenProbeStatus:
+    """Probe a cached token without treating transient failures as expiry."""
     for attempt in range(2):
         try:
-            r = client.raw("GET", client.base + "/kyq/static/frontApi/room/queryAllRoomList/",
-                           headers={"Authorization": "Bearer " + token,
-                                    "Referer": client.base + "/kyq-v/"})
+            r = client.raw(
+                "GET",
+                client.base + "/kyq/static/frontApi/room/queryAllRoomList/",
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Referer": client.base + "/kyq-v/",
+                },
+            )
             j = r.json()
-            if j.get("data"):
-                return True
-            if "频繁" in str(j.get("message") or ""):
-                if attempt == 0:
-                    time.sleep(3)
-                    continue
-                return True  # 限流说明会话在服务端正常处理，视为存活
-            return False
-        except Exception:
-            return False
-    return False
+        except RequestLimitError:
+            raise
+        except Exception as exc:
+            log.warning("token 探活无法判定: %s", exc)
+            return TokenProbeStatus.INDETERMINATE
+        if j.get("data"):
+            return TokenProbeStatus.ALIVE
+        if is_token_expired(j):
+            return TokenProbeStatus.EXPIRED
+        if "频繁" in str(j.get("message") or ""):
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            return TokenProbeStatus.ALIVE
+        return TokenProbeStatus.INDETERMINATE
+    return TokenProbeStatus.INDETERMINATE
 
 
 # ---------------- 主入口 ----------------
@@ -175,10 +218,14 @@ def get_token(client, username: str, password: str,
               force_refresh: bool = False, manual: bool = False) -> str:
     """取可用 Bearer token：缓存探活 -> 失效则完整重登。manual: 人工验证码模式。"""
     state = load_state(state_file)
-    if not force_refresh and not manual and state.get("token") \
-            and token_alive(client, state["token"]):
-        log.info("使用缓存 token（探活通过）")
-        return state["token"]
+    if not force_refresh and not manual and state.get("token"):
+        probe = probe_token(client, state["token"])
+        if probe is TokenProbeStatus.ALIVE:
+            log.info("使用缓存 token（探活通过）")
+            return state["token"]
+        if probe is TokenProbeStatus.INDETERMINATE:
+            log.warning("token 探活结果不确定，暂用缓存 token")
+            return state["token"]
 
     log.info("token 缺失/失效，执行 CAS 登录链%s", "（人工验证码模式）" if manual else "")
     ocr = None if manual else _ocr_engine()
@@ -194,6 +241,8 @@ def get_token(client, username: str, password: str,
                           "username": username})
             save_state(state, state_file)
             return token
+        except RequestLimitError:
+            raise
         except AuthError:
             raise
         except Exception as e:  # 网络/解析类错误，重试

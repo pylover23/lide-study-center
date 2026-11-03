@@ -81,36 +81,10 @@ def _readable_status(summary: dict) -> str:
 
 
 TOKEN_EXPIRED_MESSAGE = "登录已失效，请重新登录"
-TOKEN_EXPIRED_MARKERS = (
-    "token访问过期",
-    "token过期",
-    "登录已过期",
-    "登录失效",
-    "登录已失效",
-    "未登录",
-    "请先登录",
-    "401",
-    "Unauthorized",
-    "unauthorized",
-)
 
 
 class TokenExpiredError(RuntimeError):
     """GUI token was invalidated by another client or backend expiry."""
-
-
-def is_token_expired_message(message) -> bool:
-    text = str(message or "")
-    return any(marker in text for marker in TOKEN_EXPIRED_MARKERS)
-
-
-def _response_indicates_token_expired(response: dict) -> bool:
-    if not isinstance(response, dict):
-        return False
-    if response.get("code") in (401, 20003):
-        return True
-    return is_token_expired_message(response.get("message"))
-
 
 def _reservation_summary_for_gui(record: dict) -> dict:
     summary = book.reservation_summary(record)
@@ -140,7 +114,7 @@ class GuiService:
         try:
             return func()
         except book.ReservationQueryError as exc:
-            if is_token_expired_message(str(exc)):
+            if login_mod.is_token_expired(exc):
                 self._expire_token()
             raise
 
@@ -289,7 +263,7 @@ class GuiService:
             response = book.submit_reservation(
                 self.client, token, room_id, seat_no, date_str, slider_code,
             )
-            if _response_indicates_token_expired(response):
+            if login_mod.is_token_expired(response):
                 self._expire_token()
             if response.get("status") is True and response.get("code") == 200:
                 return {"ok": True, "message": "预约成功", "response": response}

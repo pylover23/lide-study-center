@@ -147,7 +147,10 @@ class TestGuiService(unittest.TestCase):
         with mock.patch.object(
             book,
             "all_reservation_records",
-            side_effect=book.ReservationQueryError("token访问过期"),
+            side_effect=book.ReservationQueryError(
+                {"code": 20003, "message": "token访问过期"},
+                "预约记录查询失败",
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "登录已失效，请重新登录"):
                 service.records()

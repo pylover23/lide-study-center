@@ -14,6 +14,29 @@ from datetime import datetime, timedelta
 import numpy as np
 from PIL import Image
 
+from .httpclient import RequestLimitError
+
+class SliderServiceUnavailable(RuntimeError):
+    """Captcha generation service cannot provide a usable challenge."""
+
+    def __init__(self, response: dict, message: str | None = None):
+        self._response = response
+        self._code = response.get("code")
+        self._message = message or str(response.get("message") or "滑块服务不可用")
+        super().__init__(self._message)
+
+    @property
+    def code(self):
+        return self._code
+
+    @property
+    def message(self):
+        return self._message
+
+    @property
+    def response(self):
+        return self._response
+
 
 def _decode_bg(jpeg_bytes: bytes) -> np.ndarray:
     """背景图 -> 灰度二维数组 (H, W)。"""
@@ -135,8 +158,11 @@ def solve_slider(client, username: str, max_attempts: int = 5, log=print):
             cap = j.get("captcha") or {}
             captcha_id = j.get("id")  # 顶层 id，非 captcha.id
             bg_b64, tp_b64 = cap.get("backgroundImage", ""), cap.get("templateImage", "")
+            normalized = _json.dumps(j, ensure_ascii=False, default=str)
+            if j.get("code") == 5003 or "DISABLED" in normalized.upper():
+                raise SliderServiceUnavailable(j)
             if not bg_b64 or not tp_b64 or not captcha_id:
-                raise ValueError("gen 未返回图片/id: %s" % str(j)[:200])
+                raise SliderServiceUnavailable(j, "gen 未返回完整图片/id")
             bg = base64.b64decode(bg_b64.split(",")[-1])
             tp = base64.b64decode(tp_b64.split(",")[-1])
 
@@ -167,10 +193,16 @@ def solve_slider(client, username: str, max_attempts: int = 5, log=print):
             if j2.get("code") == 200:
                 token = (j2.get("data") or {}).get("token")
                 if token:
-                    log("  [slider] check 成功: %s" % token)
+                    log("  [slider] check 成功")
                     return token
             raise ValueError("check 失败: %s" % str(j2)[:200])
+        except RequestLimitError:
+            raise
+        except SliderServiceUnavailable:
+            raise
         except Exception as e:  # 换图重试
             last_err = e
             log("  [slider] 尝试%d失败: %s" % (attempt, e))
+            if attempt < max_attempts:
+                time.sleep(random.uniform(0.5, 1.0))
     raise RuntimeError("滑块验证码破解失败(%d次): %s" % (max_attempts, last_err))

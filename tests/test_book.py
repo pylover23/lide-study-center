@@ -71,8 +71,15 @@ class TestUserReservations(unittest.TestCase):
             },
         })
 
-        with self.assertRaisesRegex(book.ReservationQueryError, "token访问过期"):
+        with self.assertRaisesRegex(book.ReservationQueryError, "token访问过期") as raised:
             book.user_reservations(client, "token-value")
+
+        self.assertEqual(raised.exception.code, 20003)
+        self.assertEqual(raised.exception.response, {
+            "status": False,
+            "code": 20003,
+            "message": "token访问过期",
+        })
 
     def test_retries_a_rate_limited_history_page(self):
         base = FakeClient.base + "/kyq/static/frontApi/reservation/userReservation/record/0"
@@ -264,9 +271,20 @@ class TestSeatPayloads(unittest.TestCase):
                 "seatNumber": 12,
                 "authorization": True,
             },
-            {"token": "token-value"},
+            {"token": "token-value", "retry_transport": False},
         ))
 
+
+
+class TestCandidateOrdering(unittest.TestCase):
+    def test_deduplicates_before_preferences_and_exclusions(self):
+        cfg = {
+            "seatPreferLow": 3,
+            "seatPreferHigh": 5,
+            "seatExclude": [5],
+        }
+
+        self.assertEqual(book.order_candidates([8, 3, 8, 5, 3, 1], cfg), [3, 1, 8])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

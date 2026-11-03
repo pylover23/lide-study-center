@@ -4,7 +4,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from gui_workers import TkTaskRunner
-from lib.gui_service import GuiService, TOKEN_EXPIRED_MESSAGE, is_token_expired_message
+from lib import login
+from lib.gui_service import GuiService, TOKEN_EXPIRED_MESSAGE
 
 
 class LideApp:
@@ -343,7 +344,7 @@ class LideApp:
             messagebox.showerror("预约失败", result["message"])
 
     def _handle_token_expired(self, message):
-        if not is_token_expired_message(message):
+        if not login.is_token_expired(message):
             return False
         if hasattr(self.service, "token"):
             self.service.token = None

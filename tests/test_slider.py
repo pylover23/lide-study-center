@@ -2,15 +2,33 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.slider import locate_gap, build_track
+from lib.slider import (
+    SliderServiceUnavailable,
+    build_track,
+    locate_gap,
+    solve_slider,
+)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BG = os.path.join(ROOT, "artifacts", "_probe_bg.jpg")
 PIECE = os.path.join(ROOT, "artifacts", "_probe_piece.png")
 
+
+
+class FakeSliderClient:
+    base = "https://yxkj.ruc.edu.cn"
+
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def post_json(self, url, body):
+        self.calls.append((url, body))
+        return next(self.responses)
 
 class TestSlider(unittest.TestCase):
     @unittest.skipUnless(os.path.exists(BG) and os.path.exists(PIECE),
@@ -41,6 +59,49 @@ class TestSlider(unittest.TestCase):
         # 终点接近目标距离
         self.assertAlmostEqual(track[-1]["x"], 120.5, delta=1.0)
 
+
+    def test_gen_disabled_or_5003_raises_service_unavailable_once(self):
+        scenarios = [
+            {},
+            {"status": "DISABLED", "message": "disabled"},
+            {"code": 5003, "message": "请求触发过载保护"},
+        ]
+        for response in scenarios:
+            with self.subTest(response=response):
+                client = FakeSliderClient([response])
+                with self.assertRaises(SliderServiceUnavailable) as raised:
+                    solve_slider(client, "user", max_attempts=5, log=lambda _message: None)
+
+                self.assertEqual(len(client.calls), 1)
+                self.assertIn("/gen/SLIDER", client.calls[0][0])
+                self.assertEqual(raised.exception.code, response.get("code"))
+                self.assertEqual(raised.exception.response, response)
+                self.assertTrue(raised.exception.message)
+
+    def test_complete_challenge_check_failures_back_off_before_new_image(self):
+        challenge = {
+            "id": "captcha-id",
+            "captcha": {
+                "backgroundImage": "data:image/jpeg;base64,AA==",
+                "templateImage": "data:image/png;base64,AA==",
+            },
+        }
+        client = FakeSliderClient([
+            challenge,
+            {"code": 400, "message": "check rejected"},
+            challenge,
+            {"code": 400, "message": "check rejected"},
+        ])
+
+        with mock.patch("lib.slider.locate_gap", return_value=(120, 0, 1.0)), \
+                mock.patch("lib.slider.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "滑块验证码破解失败"):
+                solve_slider(client, "user", max_attempts=2, log=lambda _message: None)
+
+        self.assertEqual(len(client.calls), 4)
+        sleep.assert_called_once()
+        self.assertGreaterEqual(sleep.call_args.args[0], 0.5)
+        self.assertLessEqual(sleep.call_args.args[0], 1.0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
