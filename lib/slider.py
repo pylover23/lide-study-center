@@ -16,13 +16,33 @@ from PIL import Image
 
 from .httpclient import RequestLimitError
 
+def _response_is_service_unavailable(response: dict) -> bool:
+    text = str(response)
+    return (
+        response.get("code") == 5003
+        or "DISABLED" in text.upper()
+        or "过载保护" in text
+    )
+
+
 class SliderServiceUnavailable(RuntimeError):
-    """Captcha generation service cannot provide a usable challenge."""
+    """Captcha generation/check service cannot process another challenge."""
 
     def __init__(self, response: dict, message: str | None = None):
         self._response = response
         self._code = response.get("code")
-        self._message = message or str(response.get("message") or "滑块服务不可用")
+        server_message = str(response.get("message") or response.get("msg") or "")
+        base_message = message or server_message or "滑块服务不可用"
+        details = []
+        for key in ("code", "status", "success"):
+            if key in response:
+                details.append("%s=%r" % (key, response[key]))
+        if server_message and server_message != base_message:
+            details.append("msg=%r" % server_message)
+        self._message = (
+            "%s (%s)" % (base_message, ", ".join(details))
+            if details else base_message
+        )
         super().__init__(self._message)
 
     @property
@@ -67,23 +87,36 @@ def locate_gap(bg_jpeg_bytes: bytes, slider_png_bytes: bytes):
     """返回 (gap_x, mask_min_x, confidence)；gap_x 为背景自然坐标下缺口左边缘。"""
     lum = _decode_bg(bg_jpeg_bytes)
     _, min_x, bnd, inner = _decode_mask(slider_png_bytes)
-    H, W = lum.shape
     gx = bnd[:, 1]
     gy = bnd[:, 0]
     ix = inner[:, 1]
     iy = inner[:, 0]
+    height, width = lum.shape
+    grad = np.abs(np.diff(lum, axis=1))
+    grad_height, grad_width = grad.shape
+    if (gy.min() < 0 or iy.min() < 0
+            or gy.max() >= grad_height or iy.max() >= grad_height):
+        raise ValueError(
+            "滑块模板高度超出背景: background=%dx%d" % (width, height),
+        )
 
-    scores = np.full(W, -1e9, dtype=np.float32)
-    # 逐候选 x 平移评分（bnd/inner 与 lum 的梯度绝对差均值）
-    grad = np.abs(np.diff(lum, axis=1))  # (H, W-1)，grad[y, x] = |lum[y,x+1]-lum[y,x]|
-    for x in range(1, W - 110):
-        # 左边界像素落在 x..x+滑块宽 处，其左侧梯度取 grad[y, x+dx-1]
-        bvals = grad[gy, (gx - 1) + x]
-        # mask 内部像素梯度（不应有强边缘）
-        ivals = grad[iy, (ix - 1) + x]
-        # 越界保护
-        if x + int(gx.max()) >= W or x + int(ix.max()) >= W:
-            continue
+    # grad 的宽度比原图少 1；预先计算完整合法范围，避免先索引后检查。
+    boundary_min = int(gx.min()) - 1
+    boundary_max = int(gx.max()) - 1
+    inner_min = int(ix.min()) - 1
+    inner_max = int(ix.max()) - 1
+    start = max(1, -boundary_min, -inner_min)
+    stop = min(width, grad_width - boundary_max, grad_width - inner_max)
+    if start >= stop:
+        raise ValueError(
+            "滑块模板宽度超出背景: background=%d template=%d"
+            % (width, max(boundary_max, inner_max) + 1),
+        )
+
+    scores = np.full(width, -1e9, dtype=np.float32)
+    for x in range(start, stop):
+        bvals = grad[gy, boundary_min + x]
+        ivals = grad[iy, inner_min + x]
         scores[x] = 4.0 * bvals.mean() - ivals.mean()
 
     best = int(np.argmax(scores))
@@ -158,8 +191,7 @@ def solve_slider(client, username: str, max_attempts: int = 5, log=print):
             cap = j.get("captcha") or {}
             captcha_id = j.get("id")  # 顶层 id，非 captcha.id
             bg_b64, tp_b64 = cap.get("backgroundImage", ""), cap.get("templateImage", "")
-            normalized = _json.dumps(j, ensure_ascii=False, default=str)
-            if j.get("code") == 5003 or "DISABLED" in normalized.upper():
+            if _response_is_service_unavailable(j):
                 raise SliderServiceUnavailable(j)
             if not bg_b64 or not tp_b64 or not captcha_id:
                 raise SliderServiceUnavailable(j, "gen 未返回完整图片/id")
@@ -190,6 +222,8 @@ def solve_slider(client, username: str, max_attempts: int = 5, log=print):
                 "ki": encrypt_ki(key, iv),
             }
             j2 = client.post_json(base + "/kyq/static/cap/cg/check", check_body)
+            if _response_is_service_unavailable(j2):
+                raise SliderServiceUnavailable(j2)
             if j2.get("code") == 200:
                 token = (j2.get("data") or {}).get("token")
                 if token:

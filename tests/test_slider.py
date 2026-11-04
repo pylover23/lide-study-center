@@ -4,6 +4,8 @@ import sys
 import unittest
 from unittest import mock
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.slider import (
@@ -45,6 +47,28 @@ class TestSlider(unittest.TestCase):
         drag = (gap_x - mask_min_x) / 2.0
         self.assertTrue(10 <= drag <= 245, "drag=%.1f" % drag)
 
+    def test_locate_gap_handles_599px_background_without_index_error(self):
+        background = np.zeros((4, 599), dtype=np.float32)
+        background[:, 400:] = 100
+        boundary = np.array(
+            [[0, 112], [1, 112], [2, 112], [3, 112]],
+            dtype=np.int32,
+        )
+        inner = np.array(
+            [[0, 10], [1, 10], [2, 10], [3, 10]],
+            dtype=np.int32,
+        )
+
+        with mock.patch("lib.slider._decode_bg", return_value=background), \
+                mock.patch(
+                    "lib.slider._decode_mask",
+                    return_value=(None, 0, boundary, inner),
+                ):
+            gap_x, _, confidence = locate_gap(b"", b"")
+
+        self.assertEqual(gap_x, 288)
+        self.assertGreater(confidence, 0.5)
+
     def test_build_track_shape(self):
         track = build_track(120.5)
         self.assertGreaterEqual(len(track), 30)
@@ -77,6 +101,34 @@ class TestSlider(unittest.TestCase):
                 self.assertEqual(raised.exception.code, response.get("code"))
                 self.assertEqual(raised.exception.response, response)
                 self.assertTrue(raised.exception.message)
+
+    def test_check_5003_raises_service_unavailable_without_new_gen(self):
+        challenge = {
+            "id": "captcha-id",
+            "captcha": {
+                "backgroundImage": "data:image/jpeg;base64,AA==",
+                "templateImage": "data:image/png;base64,AA==",
+            },
+        }
+        overload = {
+            "code": 5003,
+            "msg": "请求触发过载保护 请重试",
+            "data": "",
+            "success": False,
+        }
+        client = FakeSliderClient([challenge, overload])
+
+        with mock.patch("lib.slider.locate_gap", return_value=(120, 0, 1.0)), \
+                mock.patch("lib.slider.time.sleep") as sleep:
+            with self.assertRaises(SliderServiceUnavailable) as raised:
+                solve_slider(client, "user", max_attempts=5, log=lambda _message: None)
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("/check", client.calls[-1][0])
+        self.assertEqual(raised.exception.code, 5003)
+        self.assertIn("请求触发过载保护", raised.exception.message)
+        self.assertIn("code=5003", raised.exception.message)
+        sleep.assert_not_called()
 
     def test_complete_challenge_check_failures_back_off_before_new_image(self):
         challenge = {

@@ -129,6 +129,8 @@ class BookingResult(Enum):
     CAPTCHA_UNAVAILABLE = "captcha_unavailable"
     TRANSIENT_ERROR = "transient_error"
 
+CAPTCHA_COOLDOWN_SECONDS = (5, 8, 12, 20, 30)
+
 
 def _inc_stat(client, key: str) -> None:
     client.stats[key] = client.stats.get(key, 0) + 1
@@ -244,6 +246,7 @@ def do_grab(cfg, target: str) -> int:
         poll_until = time.time() + cfg.get("pollMaxMin", 20) * 60
         auth_refreshed = False
         query_failure_rounds = 0
+        captcha_cooldown_streak = 0
 
         while True:
             successful_queries = 0
@@ -306,6 +309,8 @@ def do_grab(cfg, target: str) -> int:
                 result = try_book_room(
                     client, token, room, candidates, target, cfg, attempted,
                 )
+                if result is not BookingResult.CAPTCHA_UNAVAILABLE:
+                    captcha_cooldown_streak = 0
                 if result is BookingResult.OK:
                     latest_state = login.load_state(STATE_FILE)
                     latest_state["lastSuccessDate"] = target
@@ -342,8 +347,18 @@ def do_grab(cfg, target: str) -> int:
                     _summary(cfg, target, "window_closed", EXIT_FULL, t0, client)
                     return EXIT_FULL
                 if result is BookingResult.CAPTCHA_UNAVAILABLE:
-                    log.warning("captcha_unavailable 全局冷却 5 秒后重查原座")
-                    time.sleep(5)
+                    cooldown = CAPTCHA_COOLDOWN_SECONDS[
+                        min(captcha_cooldown_streak,
+                            len(CAPTCHA_COOLDOWN_SECONDS) - 1)
+                    ]
+                    captcha_cooldown_streak += 1
+                    wait_s = cooldown + random.uniform(0, 1)
+                    log.warning(
+                        "captcha_unavailable 连续第%d次，全局冷却 %.1f 秒后重查原座",
+                        captcha_cooldown_streak,
+                        wait_s,
+                    )
+                    time.sleep(wait_s)
                     restart_scan = True
                     break
                 if result is BookingResult.TRANSIENT_ERROR:

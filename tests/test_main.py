@@ -172,7 +172,7 @@ class TestBookingRecovery(unittest.TestCase):
                                   side_effect=submissions) as submit, \
                 mock.patch.object(main, "save_artifact") as save_artifact, \
                 mock.patch.object(main, "_summary") as summary, \
-                mock.patch.object(main.random, "uniform", return_value=1.5), \
+                mock.patch.object(main.random, "uniform", return_value=0.5), \
                 mock.patch.object(main.time, "sleep") as sleep:
             result = main.do_grab(self.cfg, "2026-11-04")
 
@@ -186,10 +186,37 @@ class TestBookingRecovery(unittest.TestCase):
         self.assertEqual(get_token.call_count, 2)
         self.assertEqual(self.client.stats["captcha_reject"], 1)
         self.assertEqual(self.client.stats["token_refresh"], 1)
-        self.assertIn(mock.call(5), sleep.call_args_list)
+        self.assertIn(mock.call(5.5), sleep.call_args_list)
         self.assertEqual(saved_states[0]["token"], "new-token")
         self.assertEqual(saved_states[0]["lastSuccessDate"], "2026-11-04")
         summary.assert_called_once()
+        self.watchdog.cancel.assert_called_once()
+
+    def test_repeated_captcha_outages_use_adaptive_global_cooldown(self):
+        overload = main.SliderServiceUnavailable(
+            {"code": 5003, "msg": "请求触发过载保护 请重试"},
+        )
+        with mock.patch.object(main, "HttpClient", return_value=self.client), \
+                mock.patch.object(main, "start_watchdog", return_value=self.watchdog), \
+                mock.patch.object(main.login, "load_state", side_effect=[{}, {}]), \
+                mock.patch.object(main.login, "save_state"), \
+                mock.patch.object(main.login, "get_token", return_value="token"), \
+                mock.patch.object(main.book, "available_seats",
+                                  return_value=[23]) as query, \
+                mock.patch.object(main, "solve_slider",
+                                  side_effect=[overload, overload, "slider-ok"]), \
+                mock.patch.object(main.book, "submit_reservation",
+                                  return_value={"status": True, "code": 200}) as submit, \
+                mock.patch.object(main, "save_artifact"), \
+                mock.patch.object(main, "_summary"), \
+                mock.patch.object(main.random, "uniform", return_value=0.5), \
+                mock.patch.object(main.time, "sleep") as sleep:
+            result = main.do_grab(self.cfg, "2026-11-04")
+
+        self.assertEqual(result, main.EXIT_OK)
+        self.assertEqual(query.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5.5, 8.5])
+        submit.assert_called_once()
         self.watchdog.cancel.assert_called_once()
 
     def test_second_token_expiry_stops_after_one_refresh(self):
