@@ -21,5 +21,6 @@
   "pollMaxMin": 20,
   "maxRequests": 120,
   "watchdogSec": 720,
+  "bookingOpenTime": "07:00",
   "preWarmSec": 60
 }

@@ -82,7 +82,7 @@ def tomorrow_str() -> str:
 def resolve_day(day: str) -> str:
     """--day 参数 -> YYYY-MM-DD。支持 tomorrow(默认)/today/具体日期。
 
-    系统可预约今天和明天两天内的座位（今天的窗口 07:10 后开放）。
+    明日座位默认在前一天 07:00 开放，具体时刻由 bookingOpenTime 配置。
     """
     day = (day or "tomorrow").strip().lower()
     if day == "tomorrow":
@@ -93,6 +93,40 @@ def resolve_day(day: str) -> str:
         return datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d")
     except ValueError:
         raise SystemExit("--day 取值无效: %r（支持 tomorrow/today/YYYY-MM-DD）" % day)
+
+def booking_open_at(target: str, cfg: dict) -> datetime:
+    """Return the local opening instant for a target booking date."""
+    hhmm = str(cfg.get("bookingOpenTime", "07:00")).strip()
+    try:
+        target_midnight = datetime.strptime(target, "%Y-%m-%d")
+        open_clock = datetime.strptime(hhmm, "%H:%M")
+    except ValueError as exc:
+        raise ValueError("bookingOpenTime 必须为 HH:MM，当前为 %r" % hhmm) from exc
+    return (target_midnight - timedelta(days=1)).replace(
+        hour=open_clock.hour,
+        minute=open_clock.minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def wait_for_booking_open(target: str, cfg: dict) -> None:
+    """Hard gate: no seat query or slider request may happen before opening."""
+    opens_at = booking_open_at(target, cfg)
+    announced = False
+    while True:
+        remaining = (opens_at - datetime.now()).total_seconds()
+        if remaining <= 0:
+            if announced:
+                log.info("预约窗口已开放，开始查座并现解滑块验证码")
+            return
+        if not announced:
+            log.info(
+                "预约窗口将在 %s 开放；开放前不查座、不生成滑块验证码",
+                opens_at.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            announced = True
+        time.sleep(min(remaining, 60))
 
 
 # ---------------- 响应判定 ----------------
@@ -230,6 +264,8 @@ def do_grab(cfg, target: str) -> int:
     if state.get("lastSuccessDate") == target:
         log.info("幂等检查：%s 已成功预约，跳过", target)
         return EXIT_OK
+
+    wait_for_booking_open(target, cfg)
 
     client = HttpClient(max_requests=cfg.get("maxRequests", 120))
     watchdog = start_watchdog(cfg.get("watchdogSec", 720))

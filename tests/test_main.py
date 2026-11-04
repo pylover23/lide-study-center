@@ -6,6 +6,7 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
+from datetime import datetime as RealDateTime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -139,6 +140,50 @@ class TestBookingRecovery(unittest.TestCase):
             "maxRequests": 120,
             "watchdogSec": 30,
         }
+
+    def test_pre_open_run_waits_before_querying_or_generating_slider(self):
+        events = []
+        times = iter([
+            RealDateTime(2026, 11, 4, 6, 59, 59),
+            RealDateTime(2026, 11, 4, 7, 0, 0),
+        ])
+
+        class FakeDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return next(times)
+
+        def available(*_args):
+            events.append("query")
+            return [23]
+
+        def solve(*_args, **_kwargs):
+            events.append("solve")
+            return "slider-code"
+
+        def submit(*_args):
+            events.append("submit")
+            return {"status": True, "code": 200}
+
+        cfg = dict(self.cfg, bookingOpenTime="07:00")
+        with mock.patch.object(main, "datetime", FakeDateTime), \
+                mock.patch.object(main.time, "sleep",
+                                  side_effect=lambda seconds: events.append(("sleep", seconds))), \
+                mock.patch.object(main, "HttpClient", return_value=self.client), \
+                mock.patch.object(main, "start_watchdog", return_value=self.watchdog), \
+                mock.patch.object(main.login, "load_state", side_effect=[{}, {}]), \
+                mock.patch.object(main.login, "save_state"), \
+                mock.patch.object(main.login, "get_token", return_value="token"), \
+                mock.patch.object(main.book, "available_seats", side_effect=available), \
+                mock.patch.object(main, "solve_slider", side_effect=solve), \
+                mock.patch.object(main.book, "submit_reservation", side_effect=submit), \
+                mock.patch.object(main, "save_artifact"), \
+                mock.patch.object(main, "_summary"):
+            result = main.do_grab(cfg, "2026-11-05")
+
+        self.assertEqual(result, main.EXIT_OK)
+        self.assertEqual(events, [("sleep", 1.0), "query", "solve", "submit"])
+        self.watchdog.cancel.assert_called_once()
 
     def test_captcha_overload_and_token_expiry_keep_preferred_seat(self):
         submissions = [
