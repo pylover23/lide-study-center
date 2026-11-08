@@ -24,24 +24,50 @@ def _response_is_service_unavailable(response: dict) -> bool:
         or "过载保护" in text
     )
 
+def _safe_captcha_response_summary(response: dict) -> str:
+    """Describe a captcha response without logging images, IDs, or tokens."""
+    top_keys = sorted(str(key) for key in response)
+    captcha = response.get("captcha")
+    captcha_dict = captcha if isinstance(captcha, dict) else {}
+    data = response.get("data")
+    message = str(response.get("message") or response.get("msg") or "")
+    message = " ".join(message.split())[:160]
+    parts = []
+    for key in ("code", "status", "success"):
+        if key in response:
+            parts.append("%s=%r" % (key, response[key]))
+    if message:
+        parts.append("msg=%r" % message)
+    parts.extend([
+        "topKeys=%r" % top_keys,
+        "hasId=%r" % bool(response.get("id")),
+        "captchaType=%s" % type(captcha).__name__,
+        "captchaKeys=%r" % sorted(str(key) for key in captcha_dict),
+        "backgroundLength=%d" % len(str(captcha_dict.get("backgroundImage") or "")),
+        "templateLength=%d" % len(str(captcha_dict.get("templateImage") or "")),
+        "dataType=%s" % type(data).__name__,
+    ])
+    if isinstance(data, dict):
+        parts.append("dataKeys=%r" % sorted(str(key) for key in data))
+    elif isinstance(data, (str, bytes, list, tuple)):
+        parts.append("dataLength=%d" % len(data))
+    return ", ".join(parts)
+
 
 class SliderServiceUnavailable(RuntimeError):
     """Captcha generation/check service cannot process another challenge."""
 
-    def __init__(self, response: dict, message: str | None = None):
+    def __init__(self, response: dict, message: str | None = None,
+                 *, phase: str = "gen"):
         self._response = response
         self._code = response.get("code")
+        self._phase = phase
         server_message = str(response.get("message") or response.get("msg") or "")
         base_message = message or server_message or "滑块服务不可用"
-        details = []
-        for key in ("code", "status", "success"):
-            if key in response:
-                details.append("%s=%r" % (key, response[key]))
-        if server_message and server_message != base_message:
-            details.append("msg=%r" % server_message)
-        self._message = (
-            "%s (%s)" % (base_message, ", ".join(details))
-            if details else base_message
+        self._message = "%s [phase=%s, %s]" % (
+            base_message,
+            phase,
+            _safe_captcha_response_summary(response),
         )
         super().__init__(self._message)
 
@@ -52,6 +78,10 @@ class SliderServiceUnavailable(RuntimeError):
     @property
     def message(self):
         return self._message
+
+    @property
+    def phase(self):
+        return self._phase
 
     @property
     def response(self):
@@ -192,9 +222,13 @@ def solve_slider(client, username: str, max_attempts: int = 5, log=print):
             captcha_id = j.get("id")  # 顶层 id，非 captcha.id
             bg_b64, tp_b64 = cap.get("backgroundImage", ""), cap.get("templateImage", "")
             if _response_is_service_unavailable(j):
-                raise SliderServiceUnavailable(j)
+                raise SliderServiceUnavailable(j, phase="gen")
             if not bg_b64 or not tp_b64 or not captcha_id:
-                raise SliderServiceUnavailable(j, "gen 未返回完整图片/id")
+                raise SliderServiceUnavailable(
+                    j,
+                    "gen 未返回完整图片/id",
+                    phase="gen",
+                )
             bg = base64.b64decode(bg_b64.split(",")[-1])
             tp = base64.b64decode(tp_b64.split(",")[-1])
 
@@ -223,7 +257,7 @@ def solve_slider(client, username: str, max_attempts: int = 5, log=print):
             }
             j2 = client.post_json(base + "/kyq/static/cap/cg/check", check_body)
             if _response_is_service_unavailable(j2):
-                raise SliderServiceUnavailable(j2)
+                raise SliderServiceUnavailable(j2, phase="check")
             if j2.get("code") == 200:
                 token = (j2.get("data") or {}).get("token")
                 if token:

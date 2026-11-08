@@ -105,6 +105,44 @@ class TestScheduler(unittest.TestCase):
                 scheduler.run_daily_at("23:58", job, on_tick=lambda: ticks.append(1))
         self.assertGreaterEqual(len(ticks), 1)
 
+    def test_sleep_wakes_at_preheat_boundary_before_target(self):
+        class ClockDateTime(datetime):
+            current = datetime(2026, 8, 31, 6, 58, 0)
+
+            @classmethod
+            def now(cls):
+                return cls.current
+
+        sleeps = []
+        events = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            ClockDateTime.current += timedelta(seconds=seconds)
+
+        def preheat():
+            events.append(("preheat", ClockDateTime.current))
+
+        def job():
+            events.append(("job", ClockDateTime.current))
+            raise KeyboardInterrupt
+
+        with mock.patch.object(scheduler.time, "sleep", side_effect=sleep), \
+                mock.patch.object(scheduler, "datetime", ClockDateTime):
+            with self.assertRaises(KeyboardInterrupt):
+                scheduler.run_daily_at(
+                    "07:00",
+                    job,
+                    on_tick=preheat,
+                    pre_warm_sec=60,
+                )
+
+        self.assertEqual(sleeps, [60.0, 60.0])
+        self.assertEqual(events, [
+            ("preheat", datetime(2026, 8, 31, 6, 59, 0)),
+            ("job", datetime(2026, 8, 31, 7, 0, 0)),
+        ])
+
     def test_preheat_duration_does_not_delay_job(self):
         times = [
             datetime(2026, 8, 31, 6, 59, 0),

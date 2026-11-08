@@ -163,7 +163,7 @@ class BookingResult(Enum):
     CAPTCHA_UNAVAILABLE = "captcha_unavailable"
     TRANSIENT_ERROR = "transient_error"
 
-CAPTCHA_COOLDOWN_SECONDS = (5, 8, 12, 20, 30)
+CAPTCHA_COOLDOWN_SECONDS = (3, 5, 8, 12, 15)
 
 
 def _inc_stat(client, key: str) -> None:

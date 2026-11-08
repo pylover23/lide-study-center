@@ -231,7 +231,7 @@ class TestBookingRecovery(unittest.TestCase):
         self.assertEqual(get_token.call_count, 2)
         self.assertEqual(self.client.stats["captcha_reject"], 1)
         self.assertEqual(self.client.stats["token_refresh"], 1)
-        self.assertIn(mock.call(5.5), sleep.call_args_list)
+        self.assertIn(mock.call(3.5), sleep.call_args_list)
         self.assertEqual(saved_states[0]["token"], "new-token")
         self.assertEqual(saved_states[0]["lastSuccessDate"], "2026-11-04")
         summary.assert_called_once()
@@ -260,7 +260,7 @@ class TestBookingRecovery(unittest.TestCase):
 
         self.assertEqual(result, main.EXIT_OK)
         self.assertEqual(query.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5.5, 8.5])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [3.5, 5.5])
         submit.assert_called_once()
         self.watchdog.cancel.assert_called_once()
 

@@ -102,6 +102,37 @@ class TestSlider(unittest.TestCase):
                 self.assertEqual(raised.exception.response, response)
                 self.assertTrue(raised.exception.message)
 
+    def test_incomplete_gen_error_logs_structure_without_payloads(self):
+        response = {
+            "captcha": {
+                "backgroundImage": "SECRET_BACKGROUND_IMAGE",
+                "templateImage": "",
+            },
+            "data": "SECRET_DATA",
+            "traceId": "SECRET_TRACE_ID",
+        }
+        client = FakeSliderClient([response])
+
+        with self.assertRaises(SliderServiceUnavailable) as raised:
+            solve_slider(client, "user", max_attempts=5, log=lambda _message: None)
+
+        message = raised.exception.message
+        self.assertEqual(raised.exception.phase, "gen")
+        self.assertIn("phase=gen", message)
+        self.assertIn("topKeys=['captcha', 'data', 'traceId']", message)
+        self.assertIn("hasId=False", message)
+        self.assertIn(
+            "captchaKeys=['backgroundImage', 'templateImage']",
+            message,
+        )
+        self.assertIn("backgroundLength=23", message)
+        self.assertIn("templateLength=0", message)
+        self.assertIn("dataType=str", message)
+        self.assertIn("dataLength=11", message)
+        self.assertNotIn("SECRET_BACKGROUND_IMAGE", message)
+        self.assertNotIn("SECRET_DATA", message)
+        self.assertNotIn("SECRET_TRACE_ID", message)
+
     def test_check_5003_raises_service_unavailable_without_new_gen(self):
         challenge = {
             "id": "captcha-id",
@@ -125,6 +156,7 @@ class TestSlider(unittest.TestCase):
 
         self.assertEqual(len(client.calls), 2)
         self.assertIn("/check", client.calls[-1][0])
+        self.assertEqual(raised.exception.phase, "check")
         self.assertEqual(raised.exception.code, 5003)
         self.assertIn("请求触发过载保护", raised.exception.message)
         self.assertIn("code=5003", raised.exception.message)

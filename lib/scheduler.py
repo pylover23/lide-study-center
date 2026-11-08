@@ -49,7 +49,10 @@ def run_daily_at(hhmm: str, job, on_tick=None, pre_warm_sec: int = 60) -> None:
                 if on_tick:
                     on_tick()
                 continue
-            time.sleep(min(wait, 3600))  # 分段睡，休眠唤醒后可校准
+            sleep_for = min(wait, 3600)
+            if on_tick and pre_warm_sec > 0 and not warmed and wait > pre_warm_sec:
+                sleep_for = min(sleep_for, wait - pre_warm_sec)
+            time.sleep(max(sleep_for, 0))  # 必须在预热边界醒来，不能直接睡到触发点
 
         if pre_warm_sec > 0 and on_tick and not warmed:
             on_tick()  # 休眠唤醒错过预热点时，执行前兜底预热
