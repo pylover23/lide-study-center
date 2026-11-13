@@ -299,6 +299,8 @@ dist/LideStudyCenterGUI/        # GUI 可执行程序目录
 ### 8. 日志与产物
 
 ```text
+logs/booking.log            # 完整运行日志；与终端同步输出，午夜轮转并保留 30 份
+logs/booking.log.YYYY-MM-DD # 已轮转的历史运行日志
 logs/run-YYYY-MM-DD.jsonl   # 每轮一行 JSON 摘要（结果/耗时/请求数/重试数/退出码）
 artifacts/                  # 失败诊断：提交响应、验证码图片、登录快照
 state.json                  # 运行时状态：token、签发时间、幂等标记
@@ -315,6 +317,7 @@ state.json                  # 运行时状态：token、签发时间、幂等标
 | "预约窗口尚未开放" | `--at` 时刻早于 07:10 会白跑一轮；建议就设 07:10 |
 | "请勿频繁操作" | 脚本自动退避重试；若频繁出现，调大 `pollIntervalSec` |
 | 电脑休眠错过 07:10 | 唤醒后自动补跑一次（幂等保护），无需干预 |
+| 终端只有启动日志，但预约实际执行 | 查看 `logs/booking.log`；完整过程同时落盘，不依赖终端是否继续显示 |
 | 想确认上次是否成功 | `python main.py status` |
 
 ### 10. 单元测试

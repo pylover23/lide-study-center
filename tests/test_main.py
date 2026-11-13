@@ -1,9 +1,11 @@
 import argparse
 import io
 import json
+import logging
 import os
 import sys
 import unittest
+import tempfile
 from contextlib import redirect_stdout
 from unittest import mock
 from datetime import datetime as RealDateTime
@@ -11,6 +13,45 @@ from datetime import datetime as RealDateTime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
+
+
+class TestLogging(unittest.TestCase):
+    def test_setup_logging_writes_terminal_and_rotating_file_once(self):
+        root = logging.getLogger()
+        original_handlers = list(root.handlers)
+        original_level = root.level
+        output = io.StringIO()
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            root.handlers = []
+            with mock.patch.object(main, "LOG_DIR", temp_dir.name), \
+                    mock.patch.object(main.sys, "stdout", output):
+                main.setup_logging()
+                main.setup_logging()
+                main.log.info("预约过程日志测试")
+                for handler in root.handlers:
+                    handler.flush()
+
+            log_path = os.path.join(temp_dir.name, "booking.log")
+            with open(log_path, "r", encoding="utf-8") as file:
+                file_output = file.read()
+
+            owned_handlers = [
+                handler for handler in root.handlers
+                if getattr(handler, "_lide_handler", False)
+            ]
+            self.assertEqual(len(owned_handlers), 2)
+            self.assertEqual(output.getvalue().count("预约过程日志测试"), 1)
+            self.assertEqual(file_output.count("预约过程日志测试"), 1)
+            self.assertIn("INFO main: 预约过程日志测试", file_output)
+        finally:
+            for handler in list(root.handlers):
+                if getattr(handler, "_lide_handler", False):
+                    root.removeHandler(handler)
+                    handler.close()
+            root.handlers = original_handlers
+            root.setLevel(original_level)
+            temp_dir.cleanup()
 
 
 class TestRecordsCommand(unittest.TestCase):

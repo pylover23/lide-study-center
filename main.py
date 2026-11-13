@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+from logging.handlers import TimedRotatingFileHandler
 import random
 import sys
 import threading
@@ -43,13 +44,38 @@ def load_cfg() -> dict:
 
 
 def setup_logging():
-    os.makedirs(LOG_DIR, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+
+    # Reconfiguration must not duplicate each line when main() is invoked twice
+    # in one process. Leave third-party handlers alone.
+    for handler in list(root.handlers):
+        if getattr(handler, "_lide_handler", False):
+            root.removeHandler(handler)
+            handler.close()
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    sh._lide_handler = True
+
     root.addHandler(sh)
+    log_path = os.path.join(LOG_DIR, "booking.log")
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fh = TimedRotatingFileHandler(
+            log_path,
+            when="midnight",
+            backupCount=30,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log.warning("无法创建日志文件，仅输出终端: %s", exc)
+        return
+    fh.setFormatter(fmt)
+    fh._lide_handler = True
+    root.addHandler(fh)
+    log.info("日志输出: 终端 + %s", log_path)
 
 
 def append_jsonl(record: dict):
@@ -259,6 +285,11 @@ def try_book_room(client, token, room, seats, target_date, cfg,
 
 def do_grab(cfg, target: str) -> int:
     """Run one bounded booking state machine for ``target``."""
+    log.info(
+        "开始预约流程: target=%s, bookingOpenTime=%s",
+        target,
+        cfg.get("bookingOpenTime", "07:00"),
+    )
     t0 = time.time()
     state = login.load_state(STATE_FILE)
     if state.get("lastSuccessDate") == target:
